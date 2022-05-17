@@ -1,110 +1,103 @@
 import torch
-from torch import nn
-import copy
-from torchvision.models  import resnet50,resnet101 
-import numpy as np
 import time 
-from torch.multiprocessing import Process, Value
-# from multiprocessing import logging
-import logging
-# model used to do inference
-import multiprocessing_logging
+import json
 import ctypes
+import requests
+import logging
+import numpy as np
 
-from torch.profiler import profile, record_function, ProfilerActivity
+from torch.multiprocessing import Value
 from torchvision import datasets, transforms, models
 from PIL import Image
-import json
-import requests
 
-multiprocessing_logging.install_mp_handler()
 
+# model used to do inference
+from torchvision.models  import resnet50,resnet101 
+
+# logging function
 log = torch.multiprocessing.log_to_stderr()
 log.setLevel(logging.INFO)
 
-# from TestQ import MyQueue
-
+# model Class
 class Model:
-    def __init__(self, PATH_TO_MODEL = None, PATH_TO_LABELS = None, GPU=0 , batchSize=24, detection_threshold = 0.05):
+    def __init__(self, PATH_TO_LABELS = None, GPU=0 , batchSize=24, detection_threshold = 0.05):
         self.GPU = GPU
-        self.PATH_TO_MODEL = PATH_TO_MODEL        
         self.batchSize = batchSize
 
         self.detections_all = np.array([]).reshape(0,1000)
         self.detection_threshold = detection_threshold
 
+        # Loading ImageNet labels from online
         if type(PATH_TO_LABELS) is type(None):
             self.label = json.loads(requests.get('https://s3.amazonaws.com/deep-learning-models/image-models/imagenet_class_index.json').content) 
         
-        print(self.label)
+        # Loading the ResNet50 model from pretrained ImageNet model
+        self.model = models.resnet50(pretrained=True)   
+        self.model = self.model.to(torch.device('cuda:%d'%self.GPU))
+        self.model.eval()
 
-        try:
-            self.model = models.resnet50(pretrained=True)   
-            self.model = self.model.to(torch.device('cuda:%d'%self.GPU))
-            self.model.eval()
-
-        except Exception as e:
-            log.info("Error initializing GPU Processing and model || %s"%e)
+        # For calculating time
         self.time = []
-        print('GPU loaded...')
     
+    # Prepreocessing pipeline
     def preprocess(self, batch, transform = transforms.ToTensor()):
+        # converting image to Pillow and to tensors
         batch_tensor = [transform(Image.fromarray(np.uint8(img))) for img in batch]
         batch_tensor = torch.stack(batch_tensor, axis=0).to(torch.device('cuda:%d'%self.GPU))
         del batch
         return(batch_tensor) 
         
-
-    def batch_det(self, batch, startIdx):
-        # import ipdb;ipdb.set_trace()
+    # Batch detection function
+    def batch_det(self, batch): 
+        
+        # initializing time
         tic = time.time()
+
+        # preprocessing data batch and prediction
         batch_tensor = self.preprocess(batch)
         with torch.no_grad():
             prediction = self.model(batch_tensor)
         self.time.append(time.time() - tic)
-        detections = torch.argmax(prediction, axis=1)
-        
+        # converting predictions to labels
+        detections_tensor = torch.argmax(prediction, axis=1).cpu().detach()
+        detections = [self.label[str(i)][-1] for i in detections_tensor.numpy()]
         return(detections)
 
 
-# class running inference
+# class for multiprocessing
 class multiProc(object):
-    def __init__(self, PATH_TO_MODEL = None, PATH_TO_LABELS = None, batchSize=16, detection_threshold = 0.05, detection_block_overlap_threshold = 0.01, detection_threshold_block = 0.1):
+    # multiprocessing class initialization
+    def __init__(self, PATH_TO_LABELS = None, batchSize=16):
         self.Proc = True
         self.batchSize = batchSize
-        self.PATH_TO_MODEL = PATH_TO_MODEL 
         self.PATH_TO_LABELS = PATH_TO_LABELS
 
-        self.detection_threshold = detection_threshold
-
+        # creating multiprocessing context
         self.mp = torch.multiprocessing.get_context('spawn')
 
+        # Queues for data communication across flags 
         self.QIn = torch.multiprocessing.Queue()
         self.QOut = torch.multiprocessing.Queue()
         self.FRun = self.mp.Value(ctypes.c_bool, True)
 
+        # count for processed batches
         self.count_QOut = 0
         self.run()
 
-
-    def predict(self,  dev, PATH_TO_MODEL, PATH_TO_LABELS, batchSize, detection_threshold):
-        print("[GPU:%d] model loaded"%dev)
-        modelP = Model(PATH_TO_MODEL = PATH_TO_MODEL, PATH_TO_LABELS = PATH_TO_LABELS , GPU = dev , batchSize=batchSize, detection_threshold = detection_threshold)
-        print("[GPU:%d] model loaded"%dev)
+    # function that wraps predict function for multiprocessing
+    def predict(self,  dev, PATH_TO_LABELS, batchSize):
+        modelP = Model(PATH_TO_LABELS = PATH_TO_LABELS , GPU = dev , batchSize=batchSize)
         bFlag = True
-        # time.sleep(3)
         while(bFlag):
+            # checking global variable for interuption
             bFlag = self.FRun.value
-            print("predict",bFlag)
             while(not self.QIn.empty()):
                 imageSet = self.QIn.get()
-                for idx,(Im_k,Im_v) in enumerate(imageSet.items()):
-                    break
+                (Im_k,Im_v) = imageSet.popitem()
                 log.info("[GPU:%d] PRED : %d"%(dev, Im_k))
-                res = modelP.batch_det(Im_v,  startIdx = 0)
-                
-                self.QOut.put({Im_k:(Im_v[0][0][0],Im_v)})
-
+                # model prediction and queuing the results
+                res = modelP.batch_det(Im_v)
+                self.QOut.put({Im_k:res})
                 del imageSet,Im_k,Im_v
 
         log.info('[GPU:%d] PROC completed...'%dev)
@@ -113,33 +106,34 @@ class multiProc(object):
         torch.cuda.empty_cache()
 
         
-    
+    # starting multiprocessing with the function
     def run(self):
         try:
+            # multiprocess 
             self.processes = []
             for i in range(torch.cuda.device_count()):
-                p = self.mp.Process(target=self.predict, args=(i, self.PATH_TO_MODEL, self.PATH_TO_LABELS, self.batchSize, self.detection_threshold))
+                p = self.mp.Process(target=self.predict, args=(i, self.PATH_TO_LABELS, self.batchSize))
                 self.processes.append(p)
-                print("[GPU:%d] PROC initializing..."%i)
 
             for i,p in enumerate(self.processes):
                 print("[GPU:%d] PROC started..."%i)
                 p.start()
             
             return(True)
-
+        # error handling
         except Exception as E:
             print("ERROR spinning multiprocess\n",E)
             return(False)
-    
+
+    # Terminates the process
     def terminate(self):
             time.sleep(0.5)
             for p in self.processes:
                 p.terminate()
                 p.join()
-                p.close()
             return(True)
 
+    # function to add list of images to the queue
     def add_batches(self, frames, frameNo):
         count = frameNo
         for startIdx in range(0, len(frames), self.batchSize):
@@ -159,61 +153,53 @@ class multiProc(object):
                 return(False)
         return(True)
 
+    # unit testing method for generating random image lists adding to the queue
     def add_images(self, i, default = 100):
         for i in range(i, i+default):
-            self.QIn.put({i: 2*[np.ones((224,224, 3), dtype = np.uint8)]})
+            self.QIn.put({i: 1*[np.ones((224,224, 3), dtype = np.uint8)]})
             self.count_QOut+=1
             log.info("IMAGE ADD : %d"%i)
             time.sleep(0.1)
         print(self.QOut.qsize(),self.QIn.qsize())
 
+    # unit testing functionality
     def add_data(self):
-        self.add_images(0)
-
+        self.add_images(0, default = 100)
         print("[FINAL] QSize = %d"%self.QOut.qsize())
-        
-        count = 0
         print("completed Getting values 1-100")
         
+        # waiting for the first 100 images to complete
         while (True):
-            # print('Waiting for completeing prediction %d'%self.QOut.qsize())
             if (self.QOut.qsize() == self.count_QOut):
                 print("[QIn] QSize = %d"%self.QIn.qsize())
                 break
-        print('All images predicted')
+        print('All 100 images predicted')
 
-
-        self.add_images(100)
-        print("[FINAL] QSize = %d"%self.QOut.qsize())
-        
-
-
-        print("completed Getting values 100-200")
-        data = []
+        # collecting results from the queue
         dataDict = {}
         for i in range(self.QOut.qsize()):
             temp = self.QOut.get()
             for key,val in temp.items():
-                dataDict[key] = val[0]
-                data.append(val[1])
+                dataDict[key] = val
         print('Test %d'%len(dataDict))
+        # sorting the dictonary
+        dataDict = {key: val for key, val in sorted(dataDict.items(), key = lambda ele: ele[0])}
+        dataOut = [val for key, val in dataDict.items()]
+        # updating flag to terminate the predict function
         self.FRun.value = False
         print("Lock changed",self.FRun.value)
-        
         self.terminate()
+        
+        return(dataDict, dataOut)
 
-        print(dataDict)
 
 if __name__ == '__main__':
     print('\n'.join(['%s'%torch.cuda.get_device_name(i)     for i in range(torch.cuda.device_count())]))
-    # import ipdb;ipdb.set_trace()
-    a = multiProc(batchSize=16)
-    if a.Proc:
-        a.add_data()
+    proc = multiProc(batchSize=16)
+    if proc.Proc:
+        print(proc.add_data())
         
-    # asd = Model(GPU=0)
-    # pred = asd.batch_det(32*[np.ones((224,224,3))],1)
+    # model = Model(GPU=0)
+    # pred = model.batch_det(32*[np.ones((224,224,3))])
     # print(pred)
     exit()
-
-
