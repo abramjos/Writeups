@@ -61,6 +61,7 @@ class Model:
         # converting predictions to labels
         detections_tensor = torch.argmax(prediction, axis=1).cpu().detach()
         detections = [self.label[str(i)][-1] for i in detections_tensor.numpy()]
+        del batch_tensor
         return(detections)
 
 
@@ -81,7 +82,7 @@ class multiProc(object):
         self.FRun = self.mp.Value(ctypes.c_bool, True)
 
         # count for processed batches
-        self.count_QOut = 0
+        self.count_QIn = 0
         self.run()
 
     # function that wraps predict function for multiprocessing
@@ -125,15 +126,7 @@ class multiProc(object):
             print("ERROR spinning multiprocess\n",E)
             return(False)
 
-    # Terminates the process
-    def terminate(self):
-            time.sleep(0.5)
-            for p in self.processes:
-                p.terminate()
-                p.join()
-            return(True)
-
-    # function to add list of images to the queue
+    # function to add list of images to the queue, frameNo serves as a unique ID for continous data
     def add_batches(self, frames, frameNo):
         count = frameNo
         for startIdx in range(0, len(frames), self.batchSize):
@@ -144,7 +137,8 @@ class multiProc(object):
                 endIdx = len(frames)
 
             try:
-                self.count_QOut += 1
+                # adding list of images as a dictionary with a unique key index
+                self.count_QIn += 1
                 self.QIn.put({count:{'image':frames[startIdx:endIdx], 'ID':startIdx}})
                 log.info("IMAGE ADD : %d"%count)
 
@@ -153,41 +147,58 @@ class multiProc(object):
                 return(False)
         return(True)
 
-    # unit testing method for generating random image lists adding to the queue
+
+    # method to recover the predictions from the output queue that is sorted
+    def get_pred(self):
+        # waiting for all the predictions to complete
+        while (True):
+            if (self.QOut.qsize() == self.count_QIn):
+                print("[QIn] QSize = %d"%self.QIn.qsize())
+                break
+        # iterating through queue 
+        dataDict = {}
+        for i in range(self.QOut.qsize()):
+            temp = self.QOut.get()
+            self.count_QIn -= 1
+            for key,val in temp.items():
+                dataDict[key] = val
+
+        # sorting the output dictonary
+        dataDict = {key: val for key, val in sorted(dataDict.items(), key = lambda ele: ele[0])}
+        dataOut = [val for key, val in dataDict.items()]
+        return(dataDict, dataOut)
+
+    # Terminates the process and updating the flag/lock
+    def terminate(self):
+            self.FRun.value = False
+            print("Lock changed",self.FRun.value)
+            time.sleep(0.5)
+            for p in self.processes:
+                p.terminate()
+                p.join()
+            return(True)
+
+    # unit testing method for generating random image lists added to the queue
     def add_images(self, i, default = 100):
         for i in range(i, i+default):
+            # using a key for unique identification, you can use uuid.uuid1() or random package for unique IDs
             self.QIn.put({i: 1*[np.ones((224,224, 3), dtype = np.uint8)]})
-            self.count_QOut+=1
+            self.count_QIn+=1
             log.info("IMAGE ADD : %d"%i)
             time.sleep(0.1)
         print(self.QOut.qsize(),self.QIn.qsize())
 
-    # unit testing functionality
+    # unit testing functionality for testing pipeline
     def add_data(self):
+        # adding 100 random test images to the queue
         self.add_images(0, default = 100)
-        print("[FINAL] QSize = %d"%self.QOut.qsize())
-        print("completed Getting values 1-100")
-        
-        # waiting for the first 100 images to complete
-        while (True):
-            if (self.QOut.qsize() == self.count_QOut):
-                print("[QIn] QSize = %d"%self.QIn.qsize())
-                break
-        print('All 100 images predicted')
+        print("[FINAL] QIn/QOut = %d/%d"%(self.QIn.qsize(),self.QOut.qsize()))        
 
         # collecting results from the queue
-        dataDict = {}
-        for i in range(self.QOut.qsize()):
-            temp = self.QOut.get()
-            for key,val in temp.items():
-                dataDict[key] = val
-        print('Test %d'%len(dataDict))
-        # sorting the dictonary
-        dataDict = {key: val for key, val in sorted(dataDict.items(), key = lambda ele: ele[0])}
-        dataOut = [val for key, val in dataDict.items()]
-        # updating flag to terminate the predict function
-        self.FRun.value = False
-        print("Lock changed",self.FRun.value)
+        dataDict, dataOut = get_pred()
+        print("[FINAL] QIn/QOut = %d/%d"%(self.QIn.qsize(),self.QOut.qsize()))        
+
+        # terminating the predict processess
         self.terminate()
         
         return(dataDict, dataOut)
