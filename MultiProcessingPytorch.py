@@ -195,7 +195,7 @@ class multiProc(object):
         print("[FINAL] QIn/QOut = %d/%d"%(self.QIn.qsize(),self.QOut.qsize()))        
 
         # collecting results from the queue
-        dataDict, dataOut = get_pred()
+        dataDict, dataOut = self.get_pred()
         print("[FINAL] QIn/QOut = %d/%d"%(self.QIn.qsize(),self.QOut.qsize()))        
 
         # terminating the predict processess
