@@ -1,4 +1,4 @@
-Simple tracker(cot the cookies!) for anyone to get started!
+Simple tracker for anyone to get started!
 
 
 So lets go!
